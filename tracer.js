@@ -36,6 +36,7 @@
 // the only correlation key we need. Tool start/terminal pairs match on
 // toolCallId. Every handler is best-effort and never throws into the bus.
 
+import { context as otelContext, trace as otelTrace, TraceFlags, ROOT_CONTEXT } from "@opentelemetry/api";
 import {
   compact,
   setTraceFields,
@@ -48,6 +49,44 @@ import {
   contextSummary,
   errorAttributes,
 } from "./mapping.js";
+
+/**
+ * Parse the Langfuse SDK context tag encoded in evt.userId by the benchmark
+ * runner. Format: "…|lf:{traceId32hex}:{spanId16hex}". Returns
+ * { traceId, spanId } when present, null otherwise.
+ */
+function parseLfTag(evt) {
+  const uid = evt?.userId ?? "";
+  const m = uid.match(/\|lf:([0-9a-f]{32}):([0-9a-f]{16})$/);
+  return m ? { traceId: m[1], spanId: m[2] } : null;
+}
+
+/**
+ * Build an OTel context that treats the SDK turn span as the remote parent.
+ * Spans created inside this context land in the SDK trace under the turn span,
+ * not in OpenClaw's internal diagnostics-otel trace.
+ */
+function remoteCtxFor(lf) {
+  const spanCtx = {
+    traceId: lf.traceId,
+    spanId: lf.spanId,
+    traceFlags: TraceFlags.SAMPLED,
+    isRemote: true,
+  };
+  return otelTrace.setSpanContext(ROOT_CONTEXT, spanCtx);
+}
+
+/**
+ * Start an observation inside a remote OTel context (SDK trace).
+ * Equivalent to `tracing.startObservation(...)` but parented to the SDK span.
+ */
+function startObsInRemoteCtx(remoteCtx, tracing, name, attributes, opts) {
+  let obs;
+  otelContext.with(remoteCtx, () => {
+    obs = tracing.startObservation(name, attributes, opts);
+  });
+  return obs;
+}
 
 const DEFAULT_TTL_MS = 5 * 60_000; // end observations idle longer than this
 const DEFAULT_MAX_ENTRIES = 5000; // hard cap on live observations (leak backstop)
@@ -168,6 +207,10 @@ export function createTraceEngine(tracing, opts = {}) {
       sessioned: Boolean(sessionOf(evt)),
       // Identity used to locate the session trajectory during finalization.
       ctx: { sessionId: evt.sessionId, sessionKey: evt.sessionKey, agentId: evt.agentId, model: evt.model, provider: evt.provider },
+      // When the benchmark runner embeds a Langfuse SDK span context in userId,
+      // store the remote OTel context so synthesized observations land in the
+      // SDK trace (under the turn span) instead of the diagnostics-otel trace.
+      remoteCtx: parseLfTag(evt) ? remoteCtxFor(parseLfTag(evt)) : null,
       children: new Set(),
       runCompleted: false,
       ioSet: false,
@@ -203,6 +246,10 @@ export function createTraceEngine(tracing, opts = {}) {
     root.ctx.agentId ??= evt.agentId;
     root.ctx.model ??= evt.model;
     root.ctx.provider ??= evt.provider;
+    if (!root.remoteCtx) {
+      const lf = parseLfTag(evt);
+      if (lf) root.remoteCtx = remoteCtxFor(lf);
+    }
   }
 
   /**
@@ -299,24 +346,23 @@ export function createTraceEngine(tracing, opts = {}) {
     if (hasGeneration) return;
     const endMs = root.endMs ?? now();
     const modelName = root.ctx.model ?? "model";
-    const entry = createChild(
-      { ts: endMs },
-      root,
-      {
-        name: modelName,
-        asType: "generation",
-        attributes: compact({
-          input: content.input,
-          output: content.output,
-          model: root.ctx.model,
-          metadata: compact({
-            provider: root.ctx.provider,
-            source: "trajectory",
-          }),
-        }),
-        startMs: endMs,
-      },
-    );
+    const attrs = compact({
+      input: content.input,
+      output: content.output,
+      model: root.ctx.model,
+      metadata: compact({ provider: root.ctx.provider, source: "trajectory" }),
+    });
+    const opts = compact({ asType: "generation", startTime: toDate(endMs) });
+    let obs;
+    if (root.remoteCtx) {
+      // HTTP API mode: place observation in SDK trace under the turn span.
+      obs = startObsInRemoteCtx(root.remoteCtx, tracing, modelName, attrs, opts);
+    } else {
+      obs = root.obs.startObservation(modelName, attrs, opts);
+    }
+    const entry = { obs, kind: "generation", traceId: root.traceId, keys: [], lastMs: now(), ended: false };
+    register(entry);
+    if (root.children) root.children.add(entry);
     endEntry(entry, endMs);
   }
 
@@ -345,23 +391,24 @@ export function createTraceEngine(tracing, opts = {}) {
       for (const [callId, io] of Object.entries(toolIO)) {
         if (existingIds.has(callId)) continue;
         const asType = classifyToolType(io.name);
-        const entry = createChild(
-          { ts: endMs },
-          root,
-          {
-            name: io.name ?? asType,
-            asType,
-            attributes: compact({
-              input: io.input,
-              output: io.output,
-              level: io.isError ? "ERROR" : undefined,
-              metadata: compact({ toolCallId: callId, toolSource: "trajectory" }),
-            }),
-            startMs: endMs,
-          },
-          [callId],
-        );
-        entry.toolCallId = callId;
+        const name = io.name ?? asType;
+        const attrs = compact({
+          input: io.input,
+          output: io.output,
+          level: io.isError ? "ERROR" : undefined,
+          metadata: compact({ toolCallId: callId, toolSource: "trajectory" }),
+        });
+        const opts = compact({ asType, startTime: toDate(endMs) });
+        let obs;
+        if (root.remoteCtx) {
+          obs = startObsInRemoteCtx(root.remoteCtx, tracing, name, attrs, opts);
+        } else {
+          obs = root.obs.startObservation(name, attrs, opts);
+        }
+        const entry = { obs, kind: asType, traceId: root.traceId, toolCallId: callId, keys: [callId], lastMs: now(), ended: false };
+        live.add(entry);
+        byKey.set(callId, entry);
+        if (root.children) root.children.add(entry);
         endEntry(entry, endMs);
       }
     } catch {
