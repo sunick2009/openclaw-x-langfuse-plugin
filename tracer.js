@@ -51,14 +51,26 @@ import {
 } from "./mapping.js";
 
 /**
- * Parse the Langfuse SDK context tag encoded in evt.userId by the benchmark
- * runner. Format: "…|lf:{traceId32hex}:{spanId16hex}". Returns
- * { traceId, spanId } when present, null otherwise.
+ * Extract the Langfuse SDK trace context from evt.sessionKey, which the
+ * benchmark runner encodes as:
+ *   "{session_uuid}_{root_span_id_16hex}"
+ * OpenClaw wraps this as "agent:{agentId}:{session_uuid}_{root_span_id_16hex}".
+ *
+ * The SDK trace_id is session_uuid.replace(/-/g, '') (32-char hex), because
+ * start_group_trace sets trace_id = session_id.replace('-', '').
+ *
+ * Returns { traceId, spanId } when the encoding is detected, null otherwise
+ * (WebUI sessions have plain UUIDs without the underscore suffix, so they
+ * are never affected).
  */
-function parseLfTag(evt) {
-  const uid = evt?.userId ?? "";
-  const m = uid.match(/\|lf:([0-9a-f]{32}):([0-9a-f]{16})$/);
-  return m ? { traceId: m[1], spanId: m[2] } : null;
+function extractSdkCtxFromSessionKey(evt) {
+  const sk = evt?.sessionKey ?? "";
+  // Match the UUID + underscore + 16-hex-char suffix at the end of the key.
+  const m = sk.match(
+    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_([0-9a-f]{16})$/i,
+  );
+  if (!m) return null;
+  return { traceId: m[1].toLowerCase().replace(/-/g, ""), spanId: m[2] };
 }
 
 /**
@@ -207,10 +219,10 @@ export function createTraceEngine(tracing, opts = {}) {
       sessioned: Boolean(sessionOf(evt)),
       // Identity used to locate the session trajectory during finalization.
       ctx: { sessionId: evt.sessionId, sessionKey: evt.sessionKey, agentId: evt.agentId, model: evt.model, provider: evt.provider },
-      // When the benchmark runner embeds a Langfuse SDK span context in userId,
-      // store the remote OTel context so synthesized observations land in the
-      // SDK trace (under the turn span) instead of the diagnostics-otel trace.
-      remoteCtx: parseLfTag(evt) ? remoteCtxFor(parseLfTag(evt)) : null,
+      // When the session key contains the SDK root span ID, store a remote OTel
+      // context so synthesized observations land in the SDK trace (as siblings
+      // of the MASK spans under the root AGENT) instead of a separate webchat trace.
+      remoteCtx: (() => { const lf = extractSdkCtxFromSessionKey(evt); return lf ? remoteCtxFor(lf) : null; })(),
       children: new Set(),
       runCompleted: false,
       ioSet: false,
@@ -247,7 +259,7 @@ export function createTraceEngine(tracing, opts = {}) {
     root.ctx.model ??= evt.model;
     root.ctx.provider ??= evt.provider;
     if (!root.remoteCtx) {
-      const lf = parseLfTag(evt);
+      const lf = extractSdkCtxFromSessionKey(evt);
       if (lf) root.remoteCtx = remoteCtxFor(lf);
     }
   }
