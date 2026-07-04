@@ -102,6 +102,11 @@ export function runAttributes(evt) {
       model: evt.model,
       trigger: evt.trigger,
       channel: evt.channel,
+      // HTTP API callers (e.g. benchmark runner) set sessionKey via
+      // x-openclaw-session-key header and userId via the OpenAI 'user' field.
+      // Surfacing them in metadata helps correlate plugin traces with SDK traces.
+      sessionKey: evt.sessionKey,
+      userId: evt.userId,
     }),
   });
 }

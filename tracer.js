@@ -52,9 +52,15 @@ import {
 const DEFAULT_TTL_MS = 5 * 60_000; // end observations idle longer than this
 const DEFAULT_MAX_ENTRIES = 5000; // hard cap on live observations (leak backstop)
 
-/** Session id helper: prefer sessionId, fall back to sessionKey. */
+/**
+ * Session id helper: prefer sessionId (stable WebUI session), then sessionKey
+ * (from x-openclaw-session-key header — used by HTTP API callers such as the
+ * benchmark runner, which sets this equal to its Langfuse session_id so that
+ * plugin traces and benchmark SDK traces land in the same Langfuse session),
+ * then userId (from the OpenAI-compatible 'user' field in HTTP requests).
+ */
 function sessionOf(evt) {
-  return evt?.sessionId ?? evt?.sessionKey;
+  return evt?.sessionId ?? evt?.sessionKey ?? evt?.userId;
 }
 
 /**
@@ -142,7 +148,12 @@ export function createTraceEngine(tracing, opts = {}) {
       maybeRefreshRoot(existing, evt);
       return touch(existing);
     }
-    const name = evt.channel ?? "openclaw run";
+    // For WebUI calls evt.channel is set (e.g. "webchat"). For HTTP API calls
+    // it is often absent; fall back to the agent id so the trace is still
+    // identifiable (e.g. "openclaw/main"). A later event that does carry
+    // evt.channel will overwrite via maybeRefreshRoot (named stays false until
+    // a channel arrives).
+    const name = evt.channel ?? (evt.agentId ? `openclaw/${evt.agentId}` : null) ?? "openclaw run";
     const obs = tracing.startObservation(
       name,
       runAttributes(evt),
