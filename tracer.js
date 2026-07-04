@@ -285,6 +285,55 @@ export function createTraceEngine(tracing, opts = {}) {
   }
 
   /**
+   * Synthesize TOOL/RETRIEVER observations from the session trajectory for runs
+   * where tool.execution.* events were not emitted on the diagnostic bus.
+   *
+   * This happens for the OpenAI Responses API transport: the model server manages
+   * the agent tool loop internally and the gateway only receives the final streamed
+   * response, so no tool.execution.* diagnostic events are fired. The tool calls
+   * are still recorded in the session trajectory file, so we read them here at
+   * finalization time and create synthetic observations.
+   *
+   * If tool events DID arrive (WebUI/WebSocket mode), their entries are already in
+   * root.children, so we skip those callIds to avoid duplicates.
+   */
+  function synthesizeToolsFromTrajectory(root) {
+    if (!root || typeof resolveToolIO !== "function") return;
+    try {
+      const toolIO = resolveToolIO(probe(root));
+      if (!toolIO) return;
+      const existingIds = new Set(
+        [...root.children].filter((c) => c.toolCallId).map((c) => c.toolCallId),
+      );
+      const endMs = root.endMs ?? now();
+      for (const [callId, io] of Object.entries(toolIO)) {
+        if (existingIds.has(callId)) continue;
+        const asType = classifyToolType(io.name);
+        const entry = createChild(
+          { ts: endMs },
+          root,
+          {
+            name: io.name ?? asType,
+            asType,
+            attributes: compact({
+              input: io.input,
+              output: io.output,
+              level: io.isError ? "ERROR" : undefined,
+              metadata: compact({ toolCallId: callId, toolSource: "trajectory" }),
+            }),
+            startMs: endMs,
+          },
+          [callId],
+        );
+        entry.toolCallId = callId;
+        endEntry(entry, endMs);
+      }
+    } catch {
+      // best-effort; never block finalization
+    }
+  }
+
+  /**
    * Finalize a completed trace: set root IO, enrich+end any still-open tools, and
    * end the root span — but KEEP the entry registered (keep=true). The turn's
    * tool/context events are async-queued and can arrive *after* run.completed and
@@ -302,6 +351,9 @@ export function createTraceEngine(tracing, opts = {}) {
       }
     }
     setRootIO(root, content);
+    // For Responses API sessions where tool.execution.* events are not emitted,
+    // synthesize tool observations from the trajectory before enriching.
+    synthesizeToolsFromTrajectory(root);
     enrichAndEndTools(root);
     endEntry(root, root.endMs ?? now(), true);
   }
