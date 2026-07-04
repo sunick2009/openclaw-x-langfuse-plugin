@@ -167,7 +167,7 @@ export function createTraceEngine(tracing, opts = {}) {
       named: Boolean(evt.channel),
       sessioned: Boolean(sessionOf(evt)),
       // Identity used to locate the session trajectory during finalization.
-      ctx: { sessionId: evt.sessionId, sessionKey: evt.sessionKey, agentId: evt.agentId },
+      ctx: { sessionId: evt.sessionId, sessionKey: evt.sessionKey, agentId: evt.agentId, model: evt.model, provider: evt.provider },
       children: new Set(),
       runCompleted: false,
       ioSet: false,
@@ -201,6 +201,8 @@ export function createTraceEngine(tracing, opts = {}) {
     root.ctx.sessionId ??= evt.sessionId;
     root.ctx.sessionKey ??= evt.sessionKey;
     root.ctx.agentId ??= evt.agentId;
+    root.ctx.model ??= evt.model;
+    root.ctx.provider ??= evt.provider;
   }
 
   /**
@@ -285,6 +287,40 @@ export function createTraceEngine(tracing, opts = {}) {
   }
 
   /**
+   * Synthesize a GENERATION observation from the session trajectory for runs where
+   * model.usage events were not emitted on the diagnostic bus (Responses API
+   * transport). Only fires when no GENERATION child was already created by events.
+   * Token counts are unavailable from the trajectory, so usageDetails is omitted;
+   * input/output text and model name are recovered from model.completed entries.
+   */
+  function synthesizeGenerationFromTrajectory(root, content) {
+    if (!root || !content || (!content.input && !content.output)) return;
+    const hasGeneration = [...root.children].some((c) => c.kind === "generation");
+    if (hasGeneration) return;
+    const endMs = root.endMs ?? now();
+    const modelName = root.ctx.model ?? "model";
+    const entry = createChild(
+      { ts: endMs },
+      root,
+      {
+        name: modelName,
+        asType: "generation",
+        attributes: compact({
+          input: content.input,
+          output: content.output,
+          model: root.ctx.model,
+          metadata: compact({
+            provider: root.ctx.provider,
+            source: "trajectory",
+          }),
+        }),
+        startMs: endMs,
+      },
+    );
+    endEntry(entry, endMs);
+  }
+
+  /**
    * Synthesize TOOL/RETRIEVER observations from the session trajectory for runs
    * where tool.execution.* events were not emitted on the diagnostic bus.
    *
@@ -351,8 +387,9 @@ export function createTraceEngine(tracing, opts = {}) {
       }
     }
     setRootIO(root, content);
-    // For Responses API sessions where tool.execution.* events are not emitted,
-    // synthesize tool observations from the trajectory before enriching.
+    // For Responses API sessions where diagnostic events are not emitted on the
+    // public bus, synthesize GENERATION and TOOL/RETRIEVER from the trajectory.
+    synthesizeGenerationFromTrajectory(root, content);
     synthesizeToolsFromTrajectory(root);
     enrichAndEndTools(root);
     endEntry(root, root.endMs ?? now(), true);
